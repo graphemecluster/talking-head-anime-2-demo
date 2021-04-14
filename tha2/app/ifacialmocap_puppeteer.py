@@ -11,11 +11,12 @@ sys.path.append(os.getcwd())
 import numpy
 import torch
 import wx
+import pyvirtualcam
 
 from tha2.poser.poser import Poser
 from tha2.mocap.ifacialmocap_constants import *
 from tha2.mocap.ifacialmocap_pose_converter import IFacialMocapPoseConverter
-from tha2.util import extract_pytorch_image_from_filelike, rgba_to_numpy_image, grid_change_to_numpy_image
+from tha2.util import extract_PIL_image_from_filelike, resize_PIL_image, extract_pytorch_image_from_PIL_image, convert_output_image_from_torch_to_numpy
 
 
 class CaptureData:
@@ -154,10 +155,11 @@ class MainFrame(wx.Frame):
         self.last_pose = None
 
         self.client_thread.start()
-        self.capture_timer.Start(33)
-        self.animation_timer.Start(33)
+        self.capture_timer.Start(30)
+        self.animation_timer.Start(30)
 
         self.source_image_string = "Nothing yet!"
+        self.camera = pyvirtualcam.Camera(256, 256, 60)
 
     def on_close(self, event: wx.Event):
         self.client_thread.should_terminate = True
@@ -173,7 +175,7 @@ class MainFrame(wx.Frame):
         self.animation_panel.SetAutoLayout(1)
 
         if True:
-            self.input_panel = wx.Panel(self.animation_panel, size=(256, 368), style=wx.SIMPLE_BORDER)
+            self.input_panel = wx.Panel(self.animation_panel, size=(256, 312), style=wx.SIMPLE_BORDER)
             self.input_panel_sizer = wx.BoxSizer(wx.VERTICAL)
             self.input_panel.SetSizer(self.input_panel_sizer)
             self.input_panel.SetAutoLayout(1)
@@ -207,28 +209,6 @@ class MainFrame(wx.Frame):
                                                  choices=[str(i) for i in range(self.poser.get_output_length())])
             self.output_index_choice.SetSelection(0)
             self.animation_left_panel_sizer.Add(self.output_index_choice, 0, wx.EXPAND)
-
-            separator = wx.StaticLine(self.animation_left_panel, -1, size=(256, 5))
-            self.animation_left_panel_sizer.Add(separator, 0, wx.EXPAND)
-
-            background_text = wx.StaticText(self.animation_left_panel, label="--- Background ---",
-                                            style=wx.ALIGN_CENTER)
-            self.animation_left_panel_sizer.Add(background_text, 0, wx.EXPAND)
-
-            self.output_background_choice = wx.Choice(
-                self.animation_left_panel,
-                choices=[
-                    "TRANSPARENT",
-                    "GREEN",
-                    "BLUE",
-                    "BLACK",
-                    "WHITE"
-                ])
-            self.output_background_choice.SetSelection(0)
-            self.animation_left_panel_sizer.Add(self.output_background_choice, 0, wx.EXPAND)
-
-            separator = wx.StaticLine(self.animation_left_panel, -1, size=(256, 5))
-            self.animation_left_panel_sizer.Add(separator, 0, wx.EXPAND)
 
             self.fps_text = wx.StaticText(self.animation_left_panel, label="")
             self.animation_left_panel_sizer.Add(self.fps_text, wx.SizerFlags().Border())
@@ -370,7 +350,7 @@ class MainFrame(wx.Frame):
         dc.DrawText(self.source_image_string, 128 - w // 2, 128 - h // 2)
 
     def paint_result_image_panel(self, event: wx.Event):
-        self.update_result_image_panel(event)
+        self.last_pose = None
 
     def update_result_image_panel(self, event: wx.Event):
         tic = time.perf_counter()
@@ -391,57 +371,24 @@ class MainFrame(wx.Frame):
         pose = torch.tensor(current_pose, device=self.device)
         output_index = self.output_index_choice.GetSelection()
         output_image = self.poser.pose(self.torch_source_image, pose, output_index)[0].detach().cpu()
-
-        if output_image.shape[0] == 4:
-            numpy_image = rgba_to_numpy_image(output_image)
-        elif output_image.shape[0] == 1:
-            c, h, w = output_image.shape
-            alpha_image = torch.cat([output_image.repeat(3, 1, 1) * 2.0 - 1.0, torch.ones(1, h, w)], dim=0)
-            numpy_image = rgba_to_numpy_image(alpha_image)
-        elif output_image.shape[0] == 2:
-            numpy_image = grid_change_to_numpy_image(output_image, num_channels=4)
-        else:
-            raise RuntimeError("Unsupported # image channels: " + output_image.shape[0])
-
-        background_choice = self.output_background_choice.GetSelection()
-        if background_choice == 0:
-            pass
-        else:
-            background = numpy.zeros((numpy_image.shape[0], numpy_image.shape[1], numpy_image.shape[2]))
-            background[:, :, 3] = 1.0
-            if background_choice == 1:
-                background[:, :, 1] = 1.0
-                numpy_image = self.blend_with_background(numpy_image, background)
-            elif background_choice == 2:
-                background[:, :, 2] = 1.0
-                numpy_image = self.blend_with_background(numpy_image, background)
-            elif background_choice == 3:
-                numpy_image = self.blend_with_background(numpy_image, background)
-            else:
-                background[:, :, 0:3] = 1.0
-                numpy_image = self.blend_with_background(numpy_image, background)
-
-        numpy_image = numpy.uint8(numpy.rint(numpy_image * 255.0))
-        wx_image = wx.ImageFromBuffer(numpy_image.shape[0],
-                                      numpy_image.shape[1],
-                                      numpy_image[:, :, 0:3].tobytes(),
-                                      numpy_image[:, :, 3].tobytes())
+        numpy_image = convert_output_image_from_torch_to_numpy(output_image)
+        self.last_output_numpy_image = numpy_image
+        wx_image = wx.ImageFromBuffer(
+            numpy_image.shape[0],
+            numpy_image.shape[1],
+            numpy_image[:, :, 0:3].tobytes(),
+            numpy_image[:, :, 3].tobytes())
         wx_bitmap = wx_image.ConvertToBitmap()
 
         dc = wx.ClientDC(self.result_image_panel)
         dc.Clear()
         dc.DrawBitmap(wx_bitmap, (256 - numpy_image.shape[0]) // 2, (256 - numpy_image.shape[1]) // 2, True)
+        self.camera.send(numpy_image)
 
         toc = time.perf_counter()
         elapsed_time = toc - tic
-        fps = min(1.0 / elapsed_time, 1000.0 / 33.0)
+        fps = 1.0 / elapsed_time
         self.fps_text.SetLabelText("FPS = %0.2f" % fps)
-
-    def blend_with_background(self, numpy_image, background):
-        alpha = numpy_image[:, :, 3:4]
-        color = numpy_image[:, :, 0:3]
-        new_color = color * alpha + (1.0 - alpha) * background[:, :, 0:3]
-        return numpy.concatenate([new_color, background[:, :, 3:4]], axis=2)
 
     def load_image(self, event: wx.Event):
         dir_name = "data/illust"
@@ -449,23 +396,10 @@ class MainFrame(wx.Frame):
         if file_dialog.ShowModal() == wx.ID_OK:
             image_file_name = os.path.join(file_dialog.GetDirectory(), file_dialog.GetFilename())
             try:
-                wx_bitmap = wx.Bitmap(image_file_name)
-                image = extract_pytorch_image_from_filelike(
-                    image_file_name, scale=2.0, offset=-1.0).to(self.device)
-
-                c, h, w = image.shape
-                if c != 4 or h != 256 or w != 256:
-                    self.torch_source_image = None
-                    self.wx_source_image = None
-                else:
-                    self.wx_source_image = wx_bitmap
-                    self.torch_source_image = image
-                if c != 4:
-                    self.source_image_string = "Image must have alpha channel!"
-                if w != 256:
-                    self.source_image_string = "Image width must be 256!"
-                if h != 256:
-                    self.source_image_string = "Image height must be 256!"
+                pil_image = resize_PIL_image(extract_PIL_image_from_filelike(image_file_name))
+                w, h = pil_image.size
+                self.wx_source_image = wx.Bitmap.FromBufferRGBA(w, h, pil_image.convert("RGBA").tobytes())
+                self.torch_source_image = extract_pytorch_image_from_PIL_image(pil_image).to(self.device)
 
                 self.Refresh()
             except:
